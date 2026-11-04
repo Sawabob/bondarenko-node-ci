@@ -1,58 +1,46 @@
-name: Node.js CI
-
+name: Docker CI/CD
 on:
   push:
     branches: [main]
-
 permissions:
   contents: read
-
+concurrency:
+  group: docker-ec2-main
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/bondarenko-node-ci
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-      - name: Install dependencies
-        run: npm install
-      - name: Build
-        run: npm run build
-      - name: Upload build
-        uses: actions/upload-artifact@v4
-        with:
-          name: build
-          path: dist/
-          if-no-files-found: error
+      - name: Sign in to Docker Hub
+        env:
+          TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: printf '%s' "$TOKEN" | docker login --username "$USERNAME" --password-stdin
+      - name: Build and publish image
+        run: |
+          docker build -t "$IMAGE:$GITHUB_SHA" -t "$IMAGE:$GITHUB_REF_NAME" .
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:$GITHUB_REF_NAME"
       - name: Prepare SSH
         env:
-          SSH_KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
-          SSH_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+          KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
+          HOST_KEY: ${{ secrets.EC2_KNOWN_HOSTS }}
         run: |
           umask 077
           mkdir -p ~/.ssh
-          printf '%s' "$SSH_KEY_B64" | base64 --decode > ~/.ssh/ec2_key
-          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
-      - name: Copy build to EC2
+          printf '%s' "$KEY_B64" | base64 --decode > ~/.ssh/ec2_key
+          printf '%s\n' "$HOST_KEY" > ~/.ssh/known_hosts
+      - name: Deploy and verify on EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
         run: |
-          rsync -az -e 'ssh -i ~/.ssh/ec2_key -o BatchMode=yes -o StrictHostKeyChecking=yes' \
-            dist/ index.js "$EC2_USER@$EC2_HOST:nodeapp/"
-      - name: Start and verify application
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
-        run: |
-          ssh -i ~/.ssh/ec2_key -o BatchMode=yes -o StrictHostKeyChecking=yes "$EC2_USER@$EC2_HOST" <<'REMOTE'
+          ssh -i ~/.ssh/ec2_key -o BatchMode=yes -o StrictHostKeyChecking=yes "$EC2_USER@$EC2_HOST" bash -s -- "$IMAGE:$GITHUB_SHA" <<'REMOTE'
           set -eu
-          cd "$HOME/nodeapp"
-          if pm2 describe optima-node-ci >/dev/null 2>&1; then
-            pm2 restart optima-node-ci
-          else
-            pm2 start index.js --name optima-node-ci
-          fi
-          curl --fail --silent --show-error --retry 5 --retry-connrefused http://127.0.0.1:3000/
+          sudo docker pull "$1"
+          sudo docker rm -f nodeapp || true
+          sudo docker run -d --restart unless-stopped --name nodeapp -p 127.0.0.1:3000:3000 "$1"
+          curl -fsS --retry 5 --retry-connrefused http://127.0.0.1:3000/
           REMOTE
