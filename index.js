@@ -7,12 +7,10 @@ http.createServer(async (request, response) => {
         response.writeHead(404).end();
         return;
     }
-
     try {
-        const html = await readFile(path.join(__dirname, 'index.html'));
-        response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        response.end(html);
+        const html = await readFile(path.join(__dirname, 'dist', 'index.html'));
+        response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }).end(html);
     } catch {
         response.writeHead(500).end('Build output unavailable');
     }
-}).listen(3000, '127.0.0.1');
+}).listen(3000, '0.0.0.0');
