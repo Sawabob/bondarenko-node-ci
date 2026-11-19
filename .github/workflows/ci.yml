@@ -1,13 +1,49 @@
-name: Docker CI/CD
+name: Node.js CI and Docker deployment
+
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_to_ec2:
+        description: 'Build Docker image and deploy to EC2'
+        type: boolean
+        default: false
+
 permissions:
   contents: read
-concurrency:
-  group: docker-ec2-main
+
 jobs:
+  build:
+    name: Node.js build and artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install dependencies
+        run: npm install
+      - name: Build application
+        run: npm run build
+      - name: Verify build output
+        run: test -s dist/index.html
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-build
+          path: dist/
+          if-no-files-found: error
+
   deploy:
+    name: Docker build and EC2 deployment
+    needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_to_ec2 }}
+    concurrency:
+      group: docker-ec2-main
     runs-on: ubuntu-latest
     env:
       IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/bondarenko-node-ci
@@ -44,3 +80,4 @@ jobs:
           sudo docker run -d --restart unless-stopped --name nodeapp -p 127.0.0.1:3000:3000 "$1"
           curl -fsS --retry 5 --retry-connrefused http://127.0.0.1:3000/
           REMOTE
+
