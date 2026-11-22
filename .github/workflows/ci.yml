@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       deploy_to_ec2:
-        description: 'Build Docker image and deploy to EC2'
+        description: 'Deploy to EC2 after the Docker checks'
         type: boolean
         default: false
 
@@ -38,27 +38,51 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  deploy:
-    name: Docker build and EC2 deployment
+  docker:
+    name: Docker build, Compose check and publish
     needs: build
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_to_ec2 }}
-    concurrency:
-      group: docker-ec2-main
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    concurrency:
+      group: docker-publish-main
     env:
-      IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/bondarenko-node-ci
+      IMAGE_REPOSITORY: ${{ secrets.DOCKERHUB_USERNAME }}/bondarenko-node-ci
+      IMAGE_TAG: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v6
+      - name: Build Docker image
+        run: docker build -t "$IMAGE_REPOSITORY:$IMAGE_TAG" .
+      - name: Check app and PostgreSQL with Compose
+        run: |
+          export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+          trap 'docker compose logs app; docker compose down --volumes' EXIT
+          docker compose up -d --no-build --wait --wait-timeout 120
+          docker compose ps
+          curl -fsS http://127.0.0.1:3000/ | grep -F '<h1>Hello CI</h1>'
+          curl -fsS http://127.0.0.1:3000/healthz | grep -Fx 'postgresql: ok'
       - name: Sign in to Docker Hub
         env:
           TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: printf '%s' "$TOKEN" | docker login --username "$USERNAME" --password-stdin
-      - name: Build and publish image
+      - name: Publish commit and branch tags
         run: |
-          docker build -t "$IMAGE:$GITHUB_SHA" -t "$IMAGE:$GITHUB_REF_NAME" .
-          docker push "$IMAGE:$GITHUB_SHA"
-          docker push "$IMAGE:$GITHUB_REF_NAME"
+          docker push "$IMAGE_REPOSITORY:$IMAGE_TAG"
+          docker tag "$IMAGE_REPOSITORY:$IMAGE_TAG" "$IMAGE_REPOSITORY:$GITHUB_REF_NAME"
+          docker push "$IMAGE_REPOSITORY:$GITHUB_REF_NAME"
+
+  deploy:
+    name: Deploy Compose to EC2
+    needs: docker
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_to_ec2 && github.ref == 'refs/heads/main' }}
+    concurrency:
+      group: docker-ec2-main
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_REPOSITORY: ${{ secrets.DOCKERHUB_USERNAME }}/bondarenko-node-ci
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v6
       - name: Prepare SSH
         env:
           KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
@@ -73,11 +97,30 @@ jobs:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
         run: |
-          ssh -i ~/.ssh/ec2_key -o BatchMode=yes -o StrictHostKeyChecking=yes "$EC2_USER@$EC2_HOST" bash -s -- "$IMAGE:$GITHUB_SHA" <<'REMOTE'
+          host="$EC2_USER@$EC2_HOST"
+          ssh_options=(-i "$HOME/.ssh/ec2_key" -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15)
+          ssh "${ssh_options[@]}" "$host" 'sudo docker compose version && mkdir -p "$HOME/optima-node-compose"'
+          scp "${ssh_options[@]}" docker-compose.yml "$host:optima-node-compose/"
+          ssh "${ssh_options[@]}" "$host" bash -s -- "$IMAGE_REPOSITORY" "$IMAGE_TAG" <<'REMOTE'
           set -eu
-          sudo docker pull "$1"
-          sudo docker rm -f nodeapp || true
-          sudo docker run -d --restart unless-stopped --name nodeapp -p 127.0.0.1:3000:3000 "$1"
-          curl -fsS --retry 5 --retry-connrefused http://127.0.0.1:3000/
-          REMOTE
+          cd "$HOME/optima-node-compose"
 
+          if [ ! -f .env ]; then
+            umask 077
+            password="$(openssl rand -hex 24)"
+            printf 'POSTGRES_PASSWORD=%s\n' "$password" > .env
+          fi
+
+          compose() {
+            sudo env IMAGE_REPOSITORY="$image_repository" IMAGE_TAG="$image_tag" docker compose "$@"
+          }
+
+          image_repository="$1"
+          image_tag="$2"
+          compose pull
+          sudo docker rm -f nodeapp || true
+          compose up -d --no-build --wait --wait-timeout 120
+          compose ps
+          curl -fsS http://127.0.0.1:3000/ | grep -F '<h1>Hello CI</h1>'
+          curl -fsS http://127.0.0.1:3000/healthz | grep -Fx 'postgresql: ok'
+          REMOTE

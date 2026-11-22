@@ -1,8 +1,8 @@
-FROM node:22-bookworm-slim
+FROM node:lts
 WORKDIR /app
 COPY package*.json ./
 RUN npm install
-COPY index.js ./
+COPY . .
 RUN npm run build
 USER node
 EXPOSE 3000
