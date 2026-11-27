@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: node-ci-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Node.js build and artifact
@@ -43,8 +47,6 @@ jobs:
     needs: build
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    concurrency:
-      group: docker-publish-main
     env:
       IMAGE_REPOSITORY: ${{ secrets.DOCKERHUB_USERNAME }}/bondarenko-node-ci
       IMAGE_TAG: ${{ github.sha }}
@@ -74,13 +76,13 @@ jobs:
   deploy:
     name: Deploy Compose to EC2
     needs: docker
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_to_ec2 && github.ref == 'refs/heads/main' }}
-    concurrency:
-      group: docker-ec2-main
+    if: ${{ github.ref == 'refs/heads/main' && vars.OPTIMA_LAB12_DEPLOY_ENABLED == 'true' && (github.event_name == 'push' || inputs.deploy_to_ec2) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     env:
       IMAGE_REPOSITORY: ${{ secrets.DOCKERHUB_USERNAME }}/bondarenko-node-ci
       IMAGE_TAG: ${{ github.sha }}
+      EC2_HOST: ${{ secrets.EC2_HOST }}
     steps:
       - uses: actions/checkout@v6
       - name: Prepare SSH
@@ -88,18 +90,20 @@ jobs:
           KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
           HOST_KEY: ${{ secrets.EC2_KNOWN_HOSTS }}
         run: |
+          test -n "$EC2_HOST"
+          test -n "$KEY_B64"
+          test -n "$HOST_KEY"
           umask 077
           mkdir -p ~/.ssh
           printf '%s' "$KEY_B64" | base64 --decode > ~/.ssh/ec2_key
           printf '%s\n' "$HOST_KEY" > ~/.ssh/known_hosts
       - name: Deploy and verify on EC2
         env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
         run: |
           host="$EC2_USER@$EC2_HOST"
           ssh_options=(-i "$HOME/.ssh/ec2_key" -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15)
-          ssh "${ssh_options[@]}" "$host" 'sudo docker compose version && mkdir -p "$HOME/optima-node-compose"'
+          ssh "${ssh_options[@]}" "$host" 'sudo cloud-init status --wait && sudo docker compose version && mkdir -p "$HOME/optima-node-compose"'
           scp "${ssh_options[@]}" docker-compose.yml "$host:optima-node-compose/"
           ssh "${ssh_options[@]}" "$host" bash -s -- "$IMAGE_REPOSITORY" "$IMAGE_TAG" <<'REMOTE'
           set -eu
@@ -112,15 +116,18 @@ jobs:
           fi
 
           compose() {
-            sudo env IMAGE_REPOSITORY="$image_repository" IMAGE_TAG="$image_tag" docker compose "$@"
+            sudo env IMAGE_REPOSITORY="$image_repository" IMAGE_TAG="$image_tag" APP_BIND_ADDRESS=0.0.0.0 docker compose "$@"
           }
 
           image_repository="$1"
           image_tag="$2"
           compose pull
-          sudo docker rm -f nodeapp || true
           compose up -d --no-build --wait --wait-timeout 120
           compose ps
           curl -fsS http://127.0.0.1:3000/ | grep -F '<h1>Hello CI</h1>'
           curl -fsS http://127.0.0.1:3000/healthz | grep -Fx 'postgresql: ok'
           REMOTE
+      - name: Verify public HTTP on port 3000
+        run: |
+          curl -fsS --connect-timeout 10 --max-time 20 "http://$EC2_HOST:3000/" | grep -F '<h1>Hello CI</h1>'
+          curl -fsS --connect-timeout 10 --max-time 20 "http://$EC2_HOST:3000/healthz" | grep -Fx 'postgresql: ok'
